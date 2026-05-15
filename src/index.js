@@ -756,9 +756,12 @@ export default {
     // ── Step 1: Start login ──
     if (url.pathname === "/auth/login") {
       log("Worker", "Starting OAuth login flow...");
+      const loginStartedAt = Math.floor(Date.now() / 1000);
+      const loginAttemptSessionId = crypto.randomUUID();
       const codeVerifier = randomBase64Url(64);
       const codeChallenge = await sha256Base64Url(codeVerifier);
       const statePayload = {
+        loginAttemptSessionId,
         codeVerifier,
         exp: Math.floor(Date.now() / 1000) + 600,
       };
@@ -766,6 +769,14 @@ export default {
       const authorizeUrl = new URL(microsoftAuthorizeUrl(request, env, signedState));
       authorizeUrl.searchParams.set("code_challenge", codeChallenge);
       authorizeUrl.searchParams.set("code_challenge_method", "S256");
+      await auditService.recordLoginStarted({
+        request,
+        authSource: AUTH_SOURCE,
+        authLevel: "login_started",
+        stateVersion: AUTH_STATE_VERSION,
+        sessionId: loginAttemptSessionId,
+        createdAt: loginStartedAt,
+      });
       log("Worker", "Redirecting to Microsoft authorize URL");
       return redirectResponse(authorizeUrl.toString());
     }
@@ -833,6 +844,7 @@ export default {
           stateVersion: AUTH_STATE_VERSION,
           errorCode: "missing_authorization_code",
           errorMessage: "Microsoft callback did not include an authorization code",
+          sessionId: savedState.loginAttemptSessionId || null,
         });
         return htmlResponse(loginPage("Microsoft did not return an authorization code."), 400);
       }
@@ -850,6 +862,7 @@ export default {
             stateVersion: AUTH_STATE_VERSION,
             errorCode: "token_exchange_failed",
             errorMessage: error.message,
+            sessionId: savedState.loginAttemptSessionId || null,
           });
           return htmlResponse(loginPage("Sign-in could not be completed. Please try again."), 401);
         }
@@ -871,6 +884,7 @@ export default {
             stateVersion: AUTH_STATE_VERSION,
             errorCode: "id_token_invalid",
             errorMessage: error.message,
+            sessionId: savedState.loginAttemptSessionId || null,
           });
           return htmlResponse(loginPage("We could not verify your Microsoft sign-in. Please try again."), 401);
         }
@@ -886,6 +900,7 @@ export default {
             stateVersion: AUTH_STATE_VERSION,
             errorCode: "tenant_not_allowed",
             errorMessage: "User is not part of the allowed tenant or email domain",
+            sessionId: savedState.loginAttemptSessionId || null,
             email: claims.preferred_username || claims.email || null,
             userOid: claims.oid || null,
           });
@@ -904,6 +919,7 @@ export default {
             stateVersion: AUTH_STATE_VERSION,
             errorCode: "graph_lookup_failed",
             errorMessage: error.message,
+            sessionId: savedState.loginAttemptSessionId || null,
             email: claims.preferred_username || claims.email || null,
             userOid: claims.oid || null,
             role: getRoleFromClaims(claims),

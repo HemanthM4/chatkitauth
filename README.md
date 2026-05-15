@@ -7,6 +7,7 @@ A Cloudflare Workers project that implements OAuth 2.0 authentication with Micro
 - **Microsoft OAuth 2.0 Integration**: Secure authentication using Microsoft Entra ID
 - **Role-Based Access Control**: Different user roles (office, engineer) with specific permissions
 - **Session Management**: Secure cookie-based session handling with configurable TTL
+- **Login Attempt Auditing**: Writes a D1 audit row when login starts, even if the callback is handled by another app
 - **CORS Support**: Built-in CORS headers for cross-origin requests
 - **Serverless Architecture**: Runs on Cloudflare Workers for global edge deployment
 
