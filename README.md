@@ -51,7 +51,15 @@ MICROSOFT_CLIENT_ID=your_microsoft_client_id
 MICROSOFT_CLIENT_SECRET=your_microsoft_client_secret
 AUTH_REDIRECT_URI=https://your-worker.workers.dev/auth/callback
 SESSION_SECRET=your_session_secret_key
+WORKER2_REDIRECT_URL=https://worker-2.example.com/post-auth
+HANDOFF_SECRET=shared_handoff_secret
 ```
+
+`AUTH_REDIRECT_URI` must point to Worker 1 `/auth/callback` so Worker 1 can persist `auth_sessions` and `auth_login_attempts` before handing off to Worker 2.
+
+`WORKER2_REDIRECT_URL` is the final destination Worker 1 redirects to after successful callback processing. Worker 1 appends a short-lived `handoff_token` query parameter containing safe authenticated session fields.
+
+`HANDOFF_SECRET` is the shared secret Worker 1 uses to sign the handoff token and Worker 2 uses to verify it.
 
 ### Wrangler Config
 
