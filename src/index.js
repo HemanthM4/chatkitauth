@@ -15,7 +15,7 @@ const svgLogo = `<svg width="64" height="64" viewBox="0 0 35 35" fill="none" xml
 const MICROSOFT_SCOPES = "openid profile email offline_access User.Read";
 const SESSION_COOKIE = "chumley_session";
 const STATE_COOKIE = "chumley_oauth_state";
-const SESSION_TTL_SECONDS = 60 * 60 * 8;
+const SESSION_TTL_SECONDS = 60 * 60 * 8; // 8 hours
 
 // ── LOGGING ──────────────────────────────────────────────
 function log(label, msg, data = "") {
@@ -288,7 +288,6 @@ function microsoftAuthorizeUrl(request, env, state) {
 async function getUserGraphDetails(accessToken, oid) {
   log("getUserGraphDetails", "Fetching Graph data for OID", oid);
 
-  // 0. Basic profile — gives givenName / surname
   let firstName = "";
   let lastName  = "";
   try {
@@ -307,7 +306,6 @@ async function getUserGraphDetails(accessToken, oid) {
     log("getUserGraphDetails", "⚠️ /me fetch error", e.message);
   }
 
-  // 1. Licence details
   let licenseType = "Unknown";
   try {
     const licenseRes = await fetch(
@@ -326,7 +324,6 @@ async function getUserGraphDetails(accessToken, oid) {
     log("getUserGraphDetails", "⚠️ Licence fetch error", e.message);
   }
 
-  // 2. App role assignments — gives the role GUID from your app manifest
   let roleId = "Unknown";
   try {
     const rolesRes = await fetch(
@@ -349,9 +346,33 @@ async function getUserGraphDetails(accessToken, oid) {
 }
 
 // ── SESSION ───────────────────────────────────────────────
-function buildSessionPayload(claims, licenseType = "Unknown", roleId = "Unknown", firstName = "", lastName = "") {
+
+// ✅ NEW: Helper to format a Unix timestamp as a readable date string
+function formatExpiry(unixSeconds) {
+  if (!unixSeconds) return "—";
+  return new Date(unixSeconds * 1000).toUTCString();
+}
+
+// ✅ MODIFIED: now accepts tokenData from the MS token exchange response
+function buildSessionPayload(claims, licenseType = "Unknown", roleId = "Unknown", firstName = "", lastName = "", tokenData = {}) {
+  const now  = Math.floor(Date.now() / 1000);
   const role = getRoleFromClaims(claims);
   const nameParts = (claims.name || "").trim().split(/\s+/);
+
+  // ── Token expiry times ──────────────────────────────────
+  // Access token: Microsoft returns expires_in (seconds from now), default 3600 (1 hr)
+  const accessTokenExp   = now + (tokenData.expires_in   || 3600);
+
+  // Refresh token: Microsoft default is 90 days inactive / 1 year max.
+  // ext_expires_in is sometimes returned; otherwise we default to 90 days.
+  const refreshTokenExp  = now + (tokenData.ext_expires_in || 90 * 24 * 60 * 60);
+
+  // ID token: expiry is embedded in the claims itself
+  const idTokenExp       = claims.exp || (now + 3600);
+
+  // Session token: our own cookie TTL (8 hours)
+  const sessionTokenExp  = now + SESSION_TTL_SECONDS;
+
   const session = {
     name:        claims.name || claims.preferred_username,
     firstName:   firstName || claims.given_name  || nameParts[0] || "",
@@ -363,9 +384,25 @@ function buildSessionPayload(claims, licenseType = "Unknown", roleId = "Unknown"
     oid:         claims.oid,
     tid:         claims.tid,
     permissions: rolePermissions[role] || [],
-    exp:         Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS,
+
+    // ✅ Token expiry timestamps (Unix seconds)
+    createdAt:        now,
+    accessTokenExp,
+    refreshTokenExp,
+    idTokenExp,
+    sessionTokenExp,
+
+    // exp drives cookie/session verification (keep = sessionTokenExp)
+    exp: sessionTokenExp,
   };
-  log("buildSessionPayload", "Session built", session);
+
+  log("buildSessionPayload", "Session built with token expiry", {
+    accessTokenExp:  formatExpiry(accessTokenExp),
+    refreshTokenExp: formatExpiry(refreshTokenExp),
+    idTokenExp:      formatExpiry(idTokenExp),
+    sessionTokenExp: formatExpiry(sessionTokenExp),
+  });
+
   return session;
 }
 
@@ -393,18 +430,32 @@ function loginPage(errorMessage = "") {
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;700;800&display=swap" rel="stylesheet" />
     <style>
-      :root { --bg:#1e40af;--card:rgba(255,255,255,0.97);--ink:#17315c;--muted:#5f6f94;--brand:#3957a8;--brand-strong:#2a468e;--line:rgba(40,69,138,0.12);--shadow:0 36px 90px rgba(10,20,80,0.28); }
+      :root { --bg:#9bb6df;--card:rgba(255,255,255,0.97);--ink:#17315c;--muted:#5f6f94;--brand:#4d61b8;--brand-strong:#394d9e;--line:rgba(40,69,138,0.12);--shadow:0 36px 90px rgba(31,61,126,0.18); }
       * { box-sizing:border-box; }
-      body { margin:0;min-height:100vh;font-family:'Montserrat',sans-serif;color:var(--ink);background:radial-gradient(ellipse at 80% 90%,#3b5fcf 0%,transparent 55%),linear-gradient(160deg,#1e3a8a,#2563eb,#1e40af);display:grid;place-items:center; }
+      body {
+        margin:0;
+        min-height:100vh;
+        font-family:'Montserrat',sans-serif;
+        color:var(--ink);
+        background:
+          linear-gradient(135deg, rgba(255,255,255,0.22) 0 32%, rgba(255,255,255,0) 32.2%),
+          linear-gradient(196deg, rgba(122,153,210,0.34) 0 36%, rgba(122,153,210,0) 36.2%),
+          linear-gradient(180deg, rgba(255,255,255,0.1), rgba(255,255,255,0.1)),
+          radial-gradient(95% 78% at 44% 98%, rgba(111,142,199,0.78) 0 58%, rgba(111,142,199,0) 58.4%),
+          linear-gradient(180deg, #9cb6de 0%, #8eaad4 100%);
+        display:grid;
+        place-items:center;
+        overflow:hidden;
+      }
       .shell { width:min(92vw,448px);padding:20px; }
-      .card { background:var(--card);border-radius:24px;box-shadow:var(--shadow);border:1px solid rgba(255,255,255,0.6);padding:48px;text-align:center;animation:rise 400ms ease-out; }
+      .card { background:var(--card);border-radius:24px;box-shadow:var(--shadow);border:1px solid rgba(255,255,255,0.7);padding:48px;text-align:center;animation:rise 400ms ease-out; }
       .logo { width:96px;height:96px;margin:0 auto 20px;display:grid;place-items:center; }
       .logo svg { width:100%;height:100%; }
       h1 { margin:0 0 8px;font-size:1.875rem;line-height:1.2;letter-spacing:-0.01em;font-weight:700; }
       p { margin:0 0 32px;color:var(--muted);font-size:0.95rem; }
       .error { margin:0 0 16px;padding:12px 16px;border-radius:12px;background:rgba(229,73,83,0.09);color:#ac2431;font-size:0.9rem;text-align:left;line-height:1.5; }
-      .signin { display:inline-flex;align-items:center;justify-content:center;gap:12px;width:100%;padding:16px 24px;border-radius:12px;color:#fff;background:var(--brand);text-decoration:none;font-size:1rem;font-weight:700;box-shadow:0 4px 14px rgba(57,87,168,0.3);transition:background 180ms ease,box-shadow 180ms ease; }
-      .signin:hover { background:var(--brand-strong);box-shadow:0 6px 18px rgba(57,87,168,0.4); }
+      .signin { display:inline-flex;align-items:center;justify-content:center;gap:12px;width:100%;padding:16px 24px;border-radius:16px;color:#fff;background:var(--brand);text-decoration:none;font-size:1rem;font-weight:700;box-shadow:0 10px 24px rgba(57,87,168,0.28);transition:background 180ms ease,box-shadow 180ms ease,transform 180ms ease; }
+      .signin:hover { background:var(--brand-strong);box-shadow:0 14px 28px rgba(57,87,168,0.34);transform:translateY(-1px); }
       .ms { display:grid;grid-template-columns:repeat(2,9px);grid-template-rows:repeat(2,9px);gap:2px; }
       .ms span:nth-child(1){background:#f35325} .ms span:nth-child(2){background:#81bc06} .ms span:nth-child(3){background:#05a6f0} .ms span:nth-child(4){background:#ffba08}
       .footer { margin-top:24px;padding-top:20px;border-top:1px solid var(--line);display:flex;justify-content:center;align-items:center;gap:10px;color:#65749a;font-size:0.9rem; }
@@ -430,8 +481,33 @@ function loginPage(errorMessage = "") {
 </html>`;
 }
 
+// ✅ NEW: Build a single token row for the expiry table
+function tokenRow(label, expiryUnix, defaultLabel) {
+  const expiryStr = expiryUnix ? new Date(expiryUnix * 1000).toLocaleString() : "—";
+  return `
+    <tr data-exp="${expiryUnix || 0}">
+      <td><strong>${label}</strong><br><span style="color:#66779f;font-size:0.78rem;">${defaultLabel}</span></td>
+      <td style="font-size:0.82rem;color:#444;">${expiryStr}</td>
+      <td class="remaining" style="font-size:0.9rem;font-weight:700;color:#17315c;font-variant-numeric:tabular-nums;">—</td>
+      <td class="status-cell"><span class="status-badge" style="display:inline-block;padding:3px 10px;border-radius:999px;font-size:0.78rem;font-weight:700;">—</span></td>
+    </tr>`;
+}
+
 function dashboardPage(session) {
   const permissions = session.permissions.map((p) => `<li>${p.replace(/_/g, " ")}</li>`).join("");
+
+  // ✅ Token expiry table rows
+  const tokenRows = [
+    tokenRow("Access Token",   session.accessTokenExp,   "Default: 1 hour"),
+    tokenRow("Refresh Token",  session.refreshTokenExp,  "Default: 90 days"),
+    tokenRow("ID Token",       session.idTokenExp,       "Default: 1 hour"),
+    tokenRow("Session Token",  session.sessionTokenExp,  "Default: 8 hours (this app)"),
+  ].join("");
+
+  const loginTime = session.createdAt
+    ? new Date(session.createdAt * 1000).toLocaleString()
+    : "—";
+
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -441,20 +517,21 @@ function dashboardPage(session) {
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;700;800&display=swap" rel="stylesheet" />
     <style>
-      :root{--page:#eef3ff;--surface:#ffffff;--ink:#17315c;--muted:#66779f;--brand:#3957a8;--line:#dbe5fb;--ok:#eaf7eb;}
+      :root{--page:#f5f7fb;--surface:#ffffff;--ink:#17315c;--muted:#66779f;--brand:#3957a8;--line:#dbe5fb;--ok:#eaf7eb;}
       *{box-sizing:border-box;}
-      body{margin:0;min-height:100vh;font-family:'Montserrat',sans-serif;color:var(--ink);background:radial-gradient(circle at top right,rgba(145,170,225,0.35),transparent 30%),linear-gradient(180deg,#f4f7ff,var(--page));padding:28px;}
-      .wrap{max-width:1080px;margin:0 auto;}
-      .topbar{display:flex;justify-content:space-between;align-items:center;gap:18px;margin-bottom:24px;}
+      body{margin:0;min-height:100vh;font-family:'Montserrat',sans-serif;color:var(--ink);background:linear-gradient(180deg,#f7f9fc 0%,#eef3f9 100%);padding:28px;}
+      .wrap{max-width:1180px;margin:0 auto;}
+      .topbar{display:flex;justify-content:space-between;align-items:center;gap:18px;margin-bottom:24px;padding:8px 0;}
       .brand{display:flex;align-items:center;gap:14px;}
       .brand svg{width:48px;height:48px;}
       .brand h1{margin:0;font-size:clamp(1.4rem,3vw,2.2rem);}
       .brand p{margin:4px 0 0;color:var(--muted);}
-      .logout{display:inline-flex;align-items:center;justify-content:center;padding:12px 18px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--ink);text-decoration:none;font-weight:700;}
-      .grid{display:grid;grid-template-columns:1.2fr 0.8fr;gap:20px;}
+      .logout{display:inline-flex;align-items:center;justify-content:center;padding:12px 18px;border-radius:999px;border:1px solid #cfd8eb;background:var(--surface);color:var(--ink);text-decoration:none;font-weight:700;box-shadow:0 8px 20px rgba(23,49,92,0.06);}
+      .grid{display:grid;grid-template-columns:1.2fr 0.8fr;gap:20px;margin-bottom:20px;}
       .panel{background:var(--surface);border:1px solid var(--line);border-radius:24px;padding:24px;box-shadow:0 14px 32px rgba(29,58,126,0.08);}
       .eyebrow{display:inline-block;background:var(--ok);color:#2f7a37;padding:8px 12px;border-radius:999px;font-size:0.86rem;font-weight:700;}
       h2{margin:16px 0 10px;font-size:1.6rem;}
+      h3{margin:0 0 16px;font-size:1.1rem;color:var(--ink);}
       ul{margin:16px 0 0;padding-left:20px;color:var(--muted);}
       li+li{margin-top:10px;}
       .stat{margin-top:18px;padding:16px;border-radius:18px;background:#f7f9ff;border:1px solid var(--line);}
@@ -462,6 +539,20 @@ function dashboardPage(session) {
       .meta strong{display:block;margin-bottom:6px;}
       .muted{color:var(--muted);}
       .badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:0.8rem;font-weight:700;background:#e8eeff;color:var(--brand);}
+
+      /* ── Token expiry table (inside profile panel) ── */
+      .divider { margin:18px 0;border:none;border-top:1px solid var(--line); }
+      .section-label { display:flex;align-items:center;gap:8px;margin-bottom:14px;font-size:0.82rem;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:var(--brand); }
+      .token-table { width:100%;border-collapse:collapse;font-size:0.82rem; }
+      .token-table thead th { text-align:left;padding:8px 10px;background:#f0f4ff;color:var(--brand);font-weight:700;font-size:0.75rem;text-transform:uppercase;letter-spacing:0.04em; }
+      .token-table thead th:first-child { border-radius:10px 0 0 10px; }
+      .token-table thead th:last-child  { border-radius:0 10px 10px 0; }
+      .token-table tbody td { padding:10px 10px;border-bottom:1px solid var(--line);vertical-align:middle; }
+      .token-table tbody tr:last-child td { border-bottom:none; }
+      .token-table tbody tr:hover td { background:#f7f9ff; }
+      .login-time { margin-top:12px;padding:8px 12px;border-radius:10px;background:#f7f9ff;border:1px solid var(--line);font-size:0.8rem;color:var(--muted); }
+      .login-time strong { color:var(--ink); }
+
       @media(max-width:860px){body{padding:18px;}.topbar{align-items:flex-start;flex-direction:column;}.grid{grid-template-columns:1fr;}}
     </style>
   </head>
@@ -471,6 +562,8 @@ function dashboardPage(session) {
         <div class="brand">${svgLogo}<div><h1>Chumley SUPPORT AI</h1><p>Signed in as <strong>${escapeHtml(session.role)}</strong></p></div></div>
         <a class="logout" href="/auth/logout">Sign out</a>
       </header>
+
+      <!-- ── Top row: welcome + profile ── -->
       <section class="grid">
         <article class="panel">
           <span class="eyebrow">✅ Authenticated</span>
@@ -479,38 +572,86 @@ function dashboardPage(session) {
           <div class="stat"><strong>Your permissions</strong><ul>${permissions}</ul></div>
         </article>
         <aside class="panel meta">
-          <div>
-            <strong>First Name</strong>
-            <span class="muted">${escapeHtml(session.firstName || "—")}</span>
-          </div>
-          <div>
-            <strong>Last Name</strong>
-            <span class="muted">${escapeHtml(session.lastName || "—")}</span>
-          </div>
-          <div>
-            <strong>Email</strong>
-            <span class="muted">${escapeHtml(session.email)}</span>
-          </div>
-          <div>
-            <strong>Role Name</strong>
-            <span class="badge">${escapeHtml(session.role)}</span>
-          </div>
+          <!-- Profile fields -->
+          <div><strong>First Name</strong><span class="muted">${escapeHtml(session.firstName || "—")}</span></div>
+          <div><strong>Last Name</strong><span class="muted">${escapeHtml(session.lastName  || "—")}</span></div>
+          <div><strong>Email</strong><span class="muted">${escapeHtml(session.email)}</span></div>
+          <div><strong>Role Name</strong><span class="badge">${escapeHtml(session.role)}</span></div>
+          <div><strong>User ID (OID)</strong><span class="muted">${escapeHtml(session.oid || "—")}</span></div>
+          <div><strong>Licence Type</strong><span class="badge">${escapeHtml(session.licenseType || "—")}</span></div>
+          <div><strong>Tenant ID</strong><span class="muted">${escapeHtml(session.tid)}</span></div>
 
-          <div>
-            <strong>User ID (OID)</strong>
-            <span class="muted">${escapeHtml(session.oid || "—")}</span>
-          </div>
-          <div>
-            <strong>Licence Type</strong>
-            <span class="badge">${escapeHtml(session.licenseType || "—")}</span>
-          </div>
-          <div>
-            <strong>Tenant ID</strong>
-            <span class="muted">${escapeHtml(session.tid)}</span>
-          </div>
+          <!-- ✅ Token expiry table — same panel, below profile -->
+          <hr class="divider" />
+          <div class="section-label">🔐 Token &amp; Session Expiry</div>
+          <table class="token-table">
+            <thead>
+              <tr>
+                <th>Token Type</th>
+                <th>Expires At</th>
+                <th>Remaining</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${tokenRows}
+            </tbody>
+          </table>
+          <div class="login-time">🕐 Session started: <strong>${escapeHtml(loginTime)}</strong></div>
         </aside>
       </section>
     </div>
+    <script>
+      function fmtRemaining(sec) {
+        if (sec <= 0) return "Expired";
+        const d = Math.floor(sec / 86400);
+        const h = Math.floor((sec % 86400) / 3600);
+        const m = Math.floor((sec % 3600) / 60);
+        const s = sec % 60;
+        if (d > 0) return d + "d " + h + "h " + m + "m " + String(s).padStart(2,"0") + "s";
+        if (h > 0) return h + "h " + m + "m " + String(s).padStart(2,"0") + "s";
+        return m + "m " + String(s).padStart(2,"0") + "s";
+      }
+
+      function tick() {
+        const now = Math.floor(Date.now() / 1000);
+        document.querySelectorAll("tr[data-exp]").forEach(function(row) {
+          const exp = parseInt(row.dataset.exp, 10);
+          if (!exp) return;
+          const remaining = exp - now;
+          const remCell  = row.querySelector(".remaining");
+          const badge    = row.querySelector(".status-badge");
+          if (!remCell || !badge) return;
+
+          remCell.textContent = fmtRemaining(remaining);
+
+          if (remaining <= 0) {
+            badge.textContent = "Expired";
+            badge.style.background = "#fdecea";
+            badge.style.color = "#ac2431";
+            remCell.style.color = "#ac2431";
+          } else if (remaining < 300) {
+            badge.textContent = "< 5 min";
+            badge.style.background = "#fdecea";
+            badge.style.color = "#ac2431";
+            remCell.style.color = "#ac2431";
+          } else if (remaining < 600) {
+            badge.textContent = "Expiring";
+            badge.style.background = "#fef3cd";
+            badge.style.color = "#b45309";
+            remCell.style.color = "#b45309";
+          } else {
+            badge.textContent = "Active";
+            badge.style.background = "#eaf7eb";
+            badge.style.color = "#2f7a37";
+            remCell.style.color = "#17315c";
+          }
+        });
+      }
+
+      tick();
+      setInterval(tick, 1000);
+    </script>
   </body>
 </html>`;
 }
@@ -527,13 +668,11 @@ export default {
 
     log("Worker", `▶ ${request.method} ${url.pathname}`);
 
-    // ── CORS preflight ──
     if (request.method === "OPTIONS") {
       log("Worker", "OPTIONS preflight — returning 204");
       return new Response(null, { status: 204, headers: getCorsHeaders(origin) });
     }
 
-    // ── Check env secrets ──
     log("Worker", "Checking env secrets...");
     log("Worker", `MICROSOFT_CLIENT_ID:     ${env.MICROSOFT_CLIENT_ID     ? "✅ loaded" : "❌ MISSING"}`);
     log("Worker", `MICROSOFT_TENANT_ID:     ${env.MICROSOFT_TENANT_ID     ? "✅ loaded" : "❌ MISSING"}`);
@@ -546,7 +685,6 @@ export default {
       return jsonResponse({ ok: false, error: "Missing Microsoft auth configuration in Worker secrets." }, 500, origin);
     }
 
-    // ── Health check ──
     if (url.pathname === "/api/health") {
       log("Worker", "Health check ✅");
       return jsonResponse({ ok: true, service: "auth-role-worker-poc" }, 200, origin);
@@ -601,31 +739,31 @@ export default {
       log("Worker", "✅ Auth code received");
 
       try {
-        // Exchange code for tokens
         const tokens = await exchangeCodeForTokens({ code, request, env, codeVerifier: savedState.codeVerifier });
         log("Worker", "✅ Tokens received — verifying ID token...");
+        // ✅ Log what Microsoft returned for token lifetimes
+        log("Worker", "Token lifetimes from MS", {
+          expires_in:     tokens.expires_in,
+          ext_expires_in: tokens.ext_expires_in,
+        });
 
-        // Verify the ID token
         const claims = await verifyIdToken(tokens.id_token, env.MICROSOFT_TENANT_ID, env.MICROSOFT_CLIENT_ID);
         log("Worker", "✅ ID token verified for user", claims.preferred_username);
 
-        // Check user is from correct company
         if (!isAllowedCompanyUser(claims, env)) {
           log("Worker", "❌ User not from allowed company/domain");
           return htmlResponse(loginPage("Access is restricted to approved company Microsoft accounts only."), 403);
         }
 
-        // Fetch extra details from Microsoft Graph
         log("Worker", "Fetching Graph API details...");
         const { licenseType, roleId, firstName, lastName } = await getUserGraphDetails(tokens.access_token, claims.oid);
 
-        // Build and store session
-        const session = buildSessionPayload(claims, licenseType, roleId, firstName, lastName);
+        // ✅ Pass tokens into buildSessionPayload so expiry times are stored
+        const session = buildSessionPayload(claims, licenseType, roleId, firstName, lastName, tokens);
         const sessionToken = await createSignedToken(session, env.SESSION_SECRET || env.MICROSOFT_CLIENT_SECRET);
-        log("Worker", "✅ Session created — redirecting to chat app");
+        log("Worker", "✅ Session created — redirecting to dashboard");
 
-        const chatAppUrl = `https://chatkitreactjs.hemanthaspect.workers.dev/?token=${encodeURIComponent(sessionToken)}`;
-        return redirectResponse(chatAppUrl, [
+        return redirectResponse("/dashboard", [
           buildCookie(SESSION_COOKIE, sessionToken, request, SESSION_TTL_SECONDS),
         ]);
 
@@ -664,10 +802,22 @@ export default {
           source:      "cloudflare-worker-poc",
           permissions: session.permissions,
         },
+        // ✅ Token expiry info exposed in API response
+        tokenExpiry: {
+          sessionStarted:  session.createdAt       ? new Date(session.createdAt       * 1000).toISOString() : null,
+          accessTokenExp:  session.accessTokenExp  ? new Date(session.accessTokenExp  * 1000).toISOString() : null,
+          refreshTokenExp: session.refreshTokenExp ? new Date(session.refreshTokenExp * 1000).toISOString() : null,
+          idTokenExp:      session.idTokenExp      ? new Date(session.idTokenExp      * 1000).toISOString() : null,
+          sessionTokenExp: session.sessionTokenExp ? new Date(session.sessionTokenExp * 1000).toISOString() : null,
+        },
       }, 200, origin);
     }
 
     // ── Dashboard page ──
+    if (url.pathname === "/dashboad") {
+      return redirectResponse("/dashboard");
+    }
+
     if (url.pathname === "/dashboard") {
       log("Worker", "Dashboard requested");
       const session = await getSession(request, env);
