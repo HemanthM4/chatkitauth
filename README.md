@@ -76,6 +76,20 @@ npx wrangler dev
 
 The development server will run on `http://localhost:8787` by default.
 
+## D1 Migrations
+
+This project now includes a D1 migration in [migrations/0002_create_auth_login_attempts.sql](/Users/hemanth/Documents/chatkitauth/migrations/0002_create_auth_login_attempts.sql) for login-attempt auditing.
+
+Apply it with Wrangler migrations:
+
+```bash
+# Apply to local preview database
+npx wrangler d1 migrations apply chumley-auth-db --local
+
+# Apply to remote database
+npx wrangler d1 migrations apply chumley-auth-db --remote
+```
+
 ## Deployment
 
 ```bash

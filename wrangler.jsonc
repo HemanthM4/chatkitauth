@@ -3,5 +3,14 @@
   "main": "src/index.js",
   "workers_dev": true,
   "preview_urls": true,
-  "compatibility_date": "2026-05-12"
+  "compatibility_date": "2026-05-12",
+  "d1_databases": [
+	{
+	"binding": "chumley_auth_db",
+	"database_name": "chumley-auth-db",
+	"database_id": "61362b26-9b10-4759-a444-0eda68f74b78",
+	"preview_database_id": "chumley-auth-db-local"
+	}
+	]
 }
+
