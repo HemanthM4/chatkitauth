@@ -1,3 +1,7 @@
+import { AuthAuditService } from "./auth/auth-audit-service.js";
+import { AuthLoginAuditRepository } from "./auth/auth-login-audit-repository.js";
+import { AuthSessionRepository } from "./auth/auth-session-repository.js";
+
 const rolePermissions = {
   office: ["view_invoices", "view_client_records", "approve_status_changes"],
   engineer: ["view_service_reports", "view_engineer_jobs", "update_job_status"],
@@ -16,11 +20,39 @@ const MICROSOFT_SCOPES = "openid profile email offline_access User.Read";
 const SESSION_COOKIE = "chumley_session";
 const STATE_COOKIE = "chumley_oauth_state";
 const SESSION_TTL_SECONDS = 60 * 60 * 8; // 8 hours
+const AUTH_SOURCE = "microsoft_entra";
+const AUTH_STATE_VERSION = 1;
 
 // ── LOGGING ──────────────────────────────────────────────
 function log(label, msg, data = "") {
   const out = data ? `[${label}] ${msg} → ${JSON.stringify(data)}` : `[${label}] ${msg}`;
   console.log(out);
+}
+
+function sanitizeAuthQueryParams(params) {
+  const sensitiveKeys = new Set(["code", "state", "code_challenge", "code_verifier", "access_token", "refresh_token", "id_token"]);
+  const entries = params instanceof URLSearchParams ? params.entries() : Object.entries(params || {});
+  const sanitized = {};
+
+  for (const [key, value] of entries) {
+    sanitized[key] = sensitiveKeys.has(key) ? "[redacted]" : value;
+  }
+
+  return sanitized;
+}
+
+function sanitizeRedirectLocation(location) {
+  try {
+    const url = new URL(location);
+    for (const key of ["code", "state", "code_challenge", "code_verifier", "access_token", "refresh_token", "id_token"]) {
+      if (url.searchParams.has(key)) {
+        url.searchParams.set(key, "[redacted]");
+      }
+    }
+    return url.toString();
+  } catch {
+    return location;
+  }
 }
 
 // ── URL / CORS ────────────────────────────────────────────
@@ -58,7 +90,7 @@ function htmlResponse(html, status = 200, extraHeaders = {}) {
 }
 
 function redirectResponse(location, cookies = []) {
-  log("redirectResponse", "Redirecting to", location);
+  log("redirectResponse", "Redirecting to", sanitizeRedirectLocation(location));
   const headers = new Headers({ location, "cache-control": "no-store" });
   for (const cookie of cookies) headers.append("Set-Cookie", cookie);
   return new Response(null, { status: 302, headers });
@@ -271,7 +303,7 @@ async function exchangeCodeForTokens({ code, request, env, codeVerifier }) {
 
 function microsoftAuthorizeUrl(request, env, state) {
   const redirectUri = getRedirectUri(request, env);
-  log("microsoftAuthorizeUrl", "Building authorize URL", { redirectUri, state });
+  log("microsoftAuthorizeUrl", "Building authorize URL", { redirectUri });
   const params = new URLSearchParams({
     client_id:     env.MICROSOFT_CLIENT_ID,
     response_type: "code",
@@ -374,6 +406,7 @@ function buildSessionPayload(claims, licenseType = "Unknown", roleId = "Unknown"
   const sessionTokenExp  = now + SESSION_TTL_SECONDS;
 
   const session = {
+    sessionId:   crypto.randomUUID(),
     name:        claims.name || claims.preferred_username,
     firstName:   firstName || claims.given_name  || nameParts[0] || "",
     lastName:    lastName  || claims.family_name || nameParts.slice(1).join(" ") || "",
@@ -660,11 +693,41 @@ function escapeHtml(value) {
   return String(value).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;");
 }
 
+function createAuthPersistence(env) {
+  const db = env.chumley_auth_db;
+  return {
+    sessionRepository: new AuthSessionRepository(db),
+    auditService: new AuthAuditService({
+      auditRepository: new AuthLoginAuditRepository(db),
+      ipHashSalt: env.SESSION_SECRET || env.MICROSOFT_CLIENT_SECRET || "",
+      logger: (message, data) => log("AuthAuditService", message, data),
+    }),
+  };
+}
+
+function buildPersistedSession(session) {
+  return {
+    sessionId: session.sessionId,
+    firstName: session.firstName || "",
+    lastName: session.lastName || "",
+    email: session.email || "",
+    userOid: session.oid || "",
+    role: session.role,
+    licenceType: session.licenseType || "",
+    createdAt: session.createdAt,
+    expiresAt: session.sessionTokenExp || session.exp,
+    authSource: AUTH_SOURCE,
+    authLevel: "authenticated",
+    stateVersion: AUTH_STATE_VERSION,
+  };
+}
+
 // ── MAIN WORKER ───────────────────────────────────────────
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const origin = request.headers.get("Origin") || url.origin;
+    const { sessionRepository, auditService } = createAuthPersistence(env);
 
     log("Worker", `▶ ${request.method} ${url.pathname}`);
 
@@ -710,23 +773,52 @@ export default {
     // ── Step 2: Microsoft callback ──
     if (url.pathname === "/auth/callback") {
       log("Worker", "Received callback from Microsoft");
-      log("Worker", "Callback query params", Object.fromEntries(url.searchParams));
+      log("Worker", "Callback query params", sanitizeAuthQueryParams(url.searchParams));
 
       const msError = url.searchParams.get("error");
       const msErrorDesc = url.searchParams.get("error_description");
       if (msError) {
         log("Worker", "❌ Microsoft returned an error", { msError, msErrorDesc });
-        return htmlResponse(loginPage(`Microsoft error: ${msError} — ${msErrorDesc || "No description"}`));
+        await auditService.recordFailure({
+          request,
+          authSource: AUTH_SOURCE,
+          authLevel: "callback_failed",
+          stateVersion: AUTH_STATE_VERSION,
+          errorCode: msError,
+          errorMessage: msErrorDesc || msError,
+        });
+        return htmlResponse(loginPage("Microsoft sign-in was cancelled or failed. Please try again."), 401);
       }
 
       log("Worker", "Verifying state token from callback...");
       const incomingSignedState = url.searchParams.get("state");
       log("Worker", `State param present: ${!!incomingSignedState}`);
 
-      const savedState = await verifySignedToken(incomingSignedState, env.SESSION_SECRET || env.MICROSOFT_CLIENT_SECRET);
+      let savedState;
+      try {
+        savedState = await verifySignedToken(incomingSignedState, env.SESSION_SECRET || env.MICROSOFT_CLIENT_SECRET);
+      } catch (error) {
+        await auditService.recordFailure({
+          request,
+          authSource: AUTH_SOURCE,
+          authLevel: "callback_failed",
+          stateVersion: AUTH_STATE_VERSION,
+          errorCode: "oauth_state_verification_error",
+          errorMessage: error.message,
+        });
+        return htmlResponse(loginPage("We could not verify your sign-in request. Please try again."), 400);
+      }
 
       if (!savedState) {
         log("Worker", "❌ State verification failed — possible CSRF or login timeout");
+        await auditService.recordFailure({
+          request,
+          authSource: AUTH_SOURCE,
+          authLevel: "callback_failed",
+          stateVersion: AUTH_STATE_VERSION,
+          errorCode: "oauth_state_invalid",
+          errorMessage: "OAuth state verification failed",
+        });
         return htmlResponse(loginPage("Session state mismatch. This can happen if cookies are blocked or the login took too long. Please try again."), 400);
       }
       log("Worker", "✅ State verified");
@@ -734,32 +826,109 @@ export default {
       const code = url.searchParams.get("code");
       if (!code) {
         log("Worker", "❌ No code in callback");
+        await auditService.recordFailure({
+          request,
+          authSource: AUTH_SOURCE,
+          authLevel: "callback_failed",
+          stateVersion: AUTH_STATE_VERSION,
+          errorCode: "missing_authorization_code",
+          errorMessage: "Microsoft callback did not include an authorization code",
+        });
         return htmlResponse(loginPage("Microsoft did not return an authorization code."), 400);
       }
       log("Worker", "✅ Auth code received");
 
       try {
-        const tokens = await exchangeCodeForTokens({ code, request, env, codeVerifier: savedState.codeVerifier });
+        let tokens;
+        try {
+          tokens = await exchangeCodeForTokens({ code, request, env, codeVerifier: savedState.codeVerifier });
+        } catch (error) {
+          await auditService.recordFailure({
+            request,
+            authSource: AUTH_SOURCE,
+            authLevel: "token_exchange_failed",
+            stateVersion: AUTH_STATE_VERSION,
+            errorCode: "token_exchange_failed",
+            errorMessage: error.message,
+          });
+          return htmlResponse(loginPage("Sign-in could not be completed. Please try again."), 401);
+        }
+
         log("Worker", "✅ Tokens received — verifying ID token...");
-        // ✅ Log what Microsoft returned for token lifetimes
         log("Worker", "Token lifetimes from MS", {
           expires_in:     tokens.expires_in,
           ext_expires_in: tokens.ext_expires_in,
         });
 
-        const claims = await verifyIdToken(tokens.id_token, env.MICROSOFT_TENANT_ID, env.MICROSOFT_CLIENT_ID);
+        let claims;
+        try {
+          claims = await verifyIdToken(tokens.id_token, env.MICROSOFT_TENANT_ID, env.MICROSOFT_CLIENT_ID);
+        } catch (error) {
+          await auditService.recordFailure({
+            request,
+            authSource: AUTH_SOURCE,
+            authLevel: "id_token_invalid",
+            stateVersion: AUTH_STATE_VERSION,
+            errorCode: "id_token_invalid",
+            errorMessage: error.message,
+          });
+          return htmlResponse(loginPage("We could not verify your Microsoft sign-in. Please try again."), 401);
+        }
+
         log("Worker", "✅ ID token verified for user", claims.preferred_username);
 
         if (!isAllowedCompanyUser(claims, env)) {
           log("Worker", "❌ User not from allowed company/domain");
+          await auditService.recordFailure({
+            request,
+            authSource: AUTH_SOURCE,
+            authLevel: "tenant_not_allowed",
+            stateVersion: AUTH_STATE_VERSION,
+            errorCode: "tenant_not_allowed",
+            errorMessage: "User is not part of the allowed tenant or email domain",
+            email: claims.preferred_username || claims.email || null,
+            userOid: claims.oid || null,
+          });
           return htmlResponse(loginPage("Access is restricted to approved company Microsoft accounts only."), 403);
         }
 
         log("Worker", "Fetching Graph API details...");
-        const { licenseType, roleId, firstName, lastName } = await getUserGraphDetails(tokens.access_token, claims.oid);
+        let graphDetails;
+        try {
+          graphDetails = await getUserGraphDetails(tokens.access_token, claims.oid);
+        } catch (error) {
+          await auditService.recordFailure({
+            request,
+            authSource: AUTH_SOURCE,
+            authLevel: "graph_lookup_failed",
+            stateVersion: AUTH_STATE_VERSION,
+            errorCode: "graph_lookup_failed",
+            errorMessage: error.message,
+            email: claims.preferred_username || claims.email || null,
+            userOid: claims.oid || null,
+            role: getRoleFromClaims(claims),
+          });
+          return htmlResponse(loginPage("Sign-in could not be completed. Please try again later."), 401);
+        }
 
-        // ✅ Pass tokens into buildSessionPayload so expiry times are stored
+        const { licenseType, roleId, firstName, lastName } = graphDetails;
+
         const session = buildSessionPayload(claims, licenseType, roleId, firstName, lastName, tokens);
+
+        try {
+          await sessionRepository.create(buildPersistedSession(session));
+        } catch (error) {
+          log("AuthSessionRepository", "Failed to persist auth session row", { error: error.message });
+        }
+
+        await auditService.recordSuccess({
+          request,
+          session,
+          authSource: AUTH_SOURCE,
+          authLevel: "authenticated",
+          stateVersion: AUTH_STATE_VERSION,
+        });
+
         const sessionToken = await createSignedToken(session, env.SESSION_SECRET || env.MICROSOFT_CLIENT_SECRET);
         log("Worker", "✅ Session created — redirecting to dashboard");
 
@@ -769,7 +938,15 @@ export default {
 
       } catch (authError) {
         log("Worker", "❌ Auth error in callback", authError.message);
-        return htmlResponse(loginPage(`Sign-in failed: ${escapeHtml(authError.message)}`), 401);
+        await auditService.recordFailure({
+          request,
+          authSource: AUTH_SOURCE,
+          authLevel: "callback_failed",
+          stateVersion: AUTH_STATE_VERSION,
+          errorCode: "callback_exception",
+          errorMessage: authError.message,
+        });
+        return htmlResponse(loginPage("Sign-in failed. Please try again later."), 401);
       }
     }
 
