@@ -1,4 +1,5 @@
 import { AuthAuditService } from "./auth/auth-audit-service.js";
+import { AuthHandoffService } from "./auth/auth-handoff-service.js";
 import { AuthLoginAuditRepository } from "./auth/auth-login-audit-repository.js";
 import { AuthSessionRepository } from "./auth/auth-session-repository.js";
 
@@ -30,7 +31,7 @@ function log(label, msg, data = "") {
 }
 
 function sanitizeAuthQueryParams(params) {
-  const sensitiveKeys = new Set(["code", "state", "code_challenge", "code_verifier", "access_token", "refresh_token", "id_token"]);
+  const sensitiveKeys = new Set(["code", "state", "code_challenge", "code_verifier", "access_token", "refresh_token", "id_token", "handoff_token"]);
   const entries = params instanceof URLSearchParams ? params.entries() : Object.entries(params || {});
   const sanitized = {};
 
@@ -44,7 +45,7 @@ function sanitizeAuthQueryParams(params) {
 function sanitizeRedirectLocation(location) {
   try {
     const url = new URL(location);
-    for (const key of ["code", "state", "code_challenge", "code_verifier", "access_token", "refresh_token", "id_token"]) {
+    for (const key of ["code", "state", "code_challenge", "code_verifier", "access_token", "refresh_token", "id_token", "handoff_token"]) {
       if (url.searchParams.has(key)) {
         url.searchParams.set(key, "[redacted]");
       }
@@ -386,7 +387,7 @@ function formatExpiry(unixSeconds) {
 }
 
 // ✅ MODIFIED: now accepts tokenData from the MS token exchange response
-function buildSessionPayload(claims, licenseType = "Unknown", roleId = "Unknown", firstName = "", lastName = "", tokenData = {}) {
+function buildSessionPayload(claims, licenseType = "Unknown", roleId = "Unknown", firstName = "", lastName = "", tokenData = {}, sessionId = crypto.randomUUID()) {
   const now  = Math.floor(Date.now() / 1000);
   const role = getRoleFromClaims(claims);
   const nameParts = (claims.name || "").trim().split(/\s+/);
@@ -406,7 +407,7 @@ function buildSessionPayload(claims, licenseType = "Unknown", roleId = "Unknown"
   const sessionTokenExp  = now + SESSION_TTL_SECONDS;
 
   const session = {
-    sessionId:   crypto.randomUUID(),
+    sessionId,
     name:        claims.name || claims.preferred_username,
     firstName:   firstName || claims.given_name  || nameParts[0] || "",
     lastName:    lastName  || claims.family_name || nameParts.slice(1).join(" ") || "",
@@ -702,6 +703,10 @@ function createAuthPersistence(env) {
       ipHashSalt: env.SESSION_SECRET || env.MICROSOFT_CLIENT_SECRET || "",
       logger: (message, data) => log("AuthAuditService", message, data),
     }),
+    handoffService: new AuthHandoffService({
+      worker2RedirectUrl: env.WORKER2_REDIRECT_URL,
+      secret: env.HANDOFF_SECRET,
+    }),
   };
 }
 
@@ -727,7 +732,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const origin = request.headers.get("Origin") || url.origin;
-    const { sessionRepository, auditService } = createAuthPersistence(env);
+    const { sessionRepository, auditService, handoffService } = createAuthPersistence(env);
 
     log("Worker", `▶ ${request.method} ${url.pathname}`);
 
@@ -742,6 +747,8 @@ export default {
     log("Worker", `MICROSOFT_CLIENT_SECRET: ${env.MICROSOFT_CLIENT_SECRET ? "✅ loaded" : "❌ MISSING"}`);
     log("Worker", `SESSION_SECRET:          ${env.SESSION_SECRET          ? "✅ loaded" : "⚠️ not set (using client secret)"}`);
     log("Worker", `AUTH_REDIRECT_URI:       ${env.AUTH_REDIRECT_URI       ? "✅ " + env.AUTH_REDIRECT_URI : "⚠️ not set (will auto-build)"}`);
+    log("Worker", `WORKER2_REDIRECT_URL:    ${env.WORKER2_REDIRECT_URL    ? "✅ " + env.WORKER2_REDIRECT_URL : "❌ MISSING"}`);
+    log("Worker", `HANDOFF_SECRET:         ${env.HANDOFF_SECRET         ? "✅ loaded" : "❌ MISSING"}`);
 
     if (!env.MICROSOFT_CLIENT_ID || !env.MICROSOFT_TENANT_ID || !env.MICROSOFT_CLIENT_SECRET) {
       log("Worker", "❌ Missing required env secrets — returning 500");
@@ -756,6 +763,13 @@ export default {
     // ── Step 1: Start login ──
     if (url.pathname === "/auth/login") {
       log("Worker", "Starting OAuth login flow...");
+      try {
+        handoffService.assertConfigured();
+      } catch (error) {
+        log("Worker", "❌ Missing Worker 2 handoff configuration", { error: error.message });
+        return htmlResponse(loginPage("Sign-in is temporarily unavailable. Please contact support."), 500);
+      }
+
       const loginStartedAt = Math.floor(Date.now() / 1000);
       const loginAttemptSessionId = crypto.randomUUID();
       const codeVerifier = randomBase64Url(64);
@@ -929,7 +943,15 @@ export default {
 
         const { licenseType, roleId, firstName, lastName } = graphDetails;
 
-        const session = buildSessionPayload(claims, licenseType, roleId, firstName, lastName, tokens);
+        const session = buildSessionPayload(
+          claims,
+          licenseType,
+          roleId,
+          firstName,
+          lastName,
+          tokens,
+          savedState.loginAttemptSessionId || crypto.randomUUID(),
+        );
 
         try {
           await sessionRepository.create(buildPersistedSession(session));
@@ -945,12 +967,9 @@ export default {
           stateVersion: AUTH_STATE_VERSION,
         });
 
-        const sessionToken = await createSignedToken(session, env.SESSION_SECRET || env.MICROSOFT_CLIENT_SECRET);
-        log("Worker", "✅ Session created — redirecting to dashboard");
-
-        return redirectResponse("/dashboard", [
-          buildCookie(SESSION_COOKIE, sessionToken, request, SESSION_TTL_SECONDS),
-        ]);
+        const worker2Redirect = await handoffService.createRedirect(session);
+        log("Worker", "✅ Session created — redirecting to Worker 2");
+        return redirectResponse(worker2Redirect);
 
       } catch (authError) {
         log("Worker", "❌ Auth error in callback", authError.message);
