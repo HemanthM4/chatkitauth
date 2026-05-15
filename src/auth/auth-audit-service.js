@@ -26,6 +26,36 @@ export class AuthAuditService {
     this.logger = logger;
   }
 
+  async recordLoginStarted({
+    request,
+    authSource,
+    authLevel = "login_started",
+    stateVersion = 1,
+    sessionId = null,
+    createdAt = Math.floor(Date.now() / 1000),
+  }) {
+    const requestMetadata = await this.getRequestMetadata(request);
+    return this.persistAttempt({
+      attemptId: crypto.randomUUID(),
+      sessionId,
+      success: 0,
+      firstName: null,
+      lastName: null,
+      email: null,
+      userOid: null,
+      role: null,
+      licenceType: null,
+      createdAt,
+      expiresAt: null,
+      authSource,
+      authLevel,
+      stateVersion,
+      errorCode: null,
+      errorMessage: null,
+      ...requestMetadata,
+    });
+  }
+
   async recordSuccess({ request, session, authSource, authLevel = "authenticated", stateVersion = 1 }) {
     const requestMetadata = await this.getRequestMetadata(request);
     return this.persistAttempt({
